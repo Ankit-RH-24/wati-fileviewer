@@ -45,15 +45,29 @@ st.markdown("""
 # --- 3. DATABASE CONNECTION ---
 @st.cache_resource
 def get_conn():
-    # We get these secrets from Vercel/Streamlit Cloud environment variables
+    # 1. Try to get secrets from Environment Variables (Vercel/Streamlit Cloud)
     url = os.getenv("TURSO_DB_URL")
     token = os.getenv("TURSO_DB_TOKEN")
 
-    if not url or not token:
-        st.error("❌ Missing Database Credentials. Please set TURSO_DB_URL and TURSO_DB_TOKEN environment variables.")
-        st.stop()
-
-    return libsql.connect(database=url, auth_token=token)
+    # 2. If secrets exist, use Turso (Cloud)
+    if url and token:
+        try:
+            return libsql.connect(database=url, auth_token=token)
+        except Exception as e:
+            st.error(f"❌ Failed to connect to Turso: {e}")
+            st.stop()
+    
+    # 3. If no secrets, try local file (for when you run on your Mac)
+    # This acts as a fallback so it still works on your machine
+    local_db = "wati_chat_logs.db"
+    if os.path.exists(local_db):
+        import sqlite3
+        return sqlite3.connect(local_db, check_same_thread=False)
+    
+    # 4. If neither works -> ERROR
+    st.error("❌ Database Connection Failed. No Turso credentials found AND no local 'wati_chat_logs.db' file found.")
+    st.info("If you are on Vercel: Make sure you added TURSO_DB_URL and TURSO_DB_TOKEN in Settings > Environment Variables.")
+    st.stop()
 
 conn = get_conn()
 

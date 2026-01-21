@@ -5,3 +5,8 @@ __pycache__/
 wati_chat_logs.db-wal
 wati_chat_logs.db-shm
 turso.txt
+ingest.py
+file1.py
+metadata.json
+custom.css
+
