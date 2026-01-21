@@ -1,19 +1,19 @@
 import streamlit as st
 import pandas as pd
 import os
-from datetime import datetime, timedelta
+import time
 
 # --- 1. PAGE CONFIG ---
 st.set_page_config(layout="wide", page_title="WATI Chat Manager")
 
-# --- 2. CSS (FIXED FOR DARK MODE) ---
+# --- 2. CSS ---
 st.markdown("""
 <style>
     .stDataFrame { width: 100%; }
     .block-container { padding-top: 2rem; padding-bottom: 2rem; }
     .stButton button { font-weight: bold; border-radius: 8px; }
     
-    /* === CHAT BUBBLE STYLING === */
+    /* Dark Mode Bubbles */
     .stChatMessage[data-testid="stChatMessage"]:has(div[aria-label="assistant"]) {
         background-color: #2e3b4e; 
         border: 1px solid #4a4a4a;
@@ -32,256 +32,166 @@ st.markdown("""
 # --- 3. CONNECTION ---
 @st.cache_resource
 def get_conn():
-    # Try Cloud first, then local
     url = os.getenv("TURSO_DB_URL")
     token = os.getenv("TURSO_DB_TOKEN")
-    
     if url and token:
         try:
             import libsql_experimental as libsql
             return libsql.connect(database=url, auth_token=token)
-        except Exception:
-            pass # Fallback silently
-
-    local_db = "wati_chat_logs.db"
-    if os.path.exists(local_db):
+        except: pass
+    
+    if os.path.exists("wati_chat_logs.db"):
         import sqlite3
-        return sqlite3.connect(local_db, check_same_thread=False)
-
-    st.error("❌ Database Connection Failed.")
+        return sqlite3.connect("wati_chat_logs.db", check_same_thread=False)
+    
+    st.error("❌ No DB Connection.")
     st.stop()
 
 conn = get_conn()
 
-# --- 4. DATA FUNCTIONS (OPTIMIZED) ---
+# --- 4. OPTIMIZED DATA FUNCTIONS ---
 
 def run_query(query, params=()):
     try:
         cursor = conn.execute(query, params)
         if cursor.description:
             columns = [description[0] for description in cursor.description]
-            data = cursor.fetchall()
-            return pd.DataFrame(data, columns=columns)
+            return pd.DataFrame(cursor.fetchall(), columns=columns)
         return pd.DataFrame()
     except Exception as e:
-        st.error(f"Query Error: {e}")
         return pd.DataFrame()
 
 def extract_number(filename):
-    if "-" in filename:
-        return filename.split("-")[0]
+    if "-" in filename: return filename.split("-")[0]
     return filename.replace(".txt", "")
 
-# CACHE: Only keep the CURRENT 500 rows in memory.
-# TTL=600 means if you leave it for 10 mins, it clears to save RAM.
-@st.cache_data(ttl=600, show_spinner=False)
-def get_batch_users(offset, limit=500, search_term=None, hide_templates=False):
-    
-    sender_filter = "AND sender NOT LIKE '%Template%'" if hide_templates else ""
+# 🔥 NEW STRATEGY: Fetch RAW rows and Group in Python
+# This avoids the slow "GROUP BY" scan in the cloud DB.
+@st.cache_data(ttl=300, show_spinner=False)
+def get_recent_users(limit=2000, search_term=None):
     
     if search_term:
-        # Search Mode: Needs to scan more, but still paginated
-        query = f"""
-            SELECT 
-                filename, 
-                COUNT(*) as count, 
-                MAX(timestamp) as last_active,
-                (SELECT message_body FROM messages m2 
-                 WHERE m2.filename = messages.filename 
-                 ORDER BY timestamp DESC LIMIT 1) as preview,
-                 (SELECT sender FROM messages m3 
-                 WHERE m3.filename = messages.filename 
-                 ORDER BY timestamp DESC LIMIT 1) as last_sender
-            FROM messages
-            WHERE filename IN (
-                SELECT DISTINCT filename FROM messages 
-                WHERE (message_body LIKE ? OR filename LIKE ?)
-                {sender_filter}
-            )
-            GROUP BY filename
-            ORDER BY last_active DESC
-            LIMIT ? OFFSET ?
-        """
-        params = (f"%{search_term}%", f"%{search_term}%", limit, offset)
-    else:
-        # BROWSE MODE: Restricted to Last 30 Days for Speed
-        # This prevents the DB from grouping 5 years of data every time
-        query = f"""
-            SELECT 
-                filename, 
-                COUNT(*) as count, 
-                MAX(timestamp) as last_active,
-                (SELECT message_body FROM messages m2 
-                 WHERE m2.filename = messages.filename 
-                 ORDER BY timestamp DESC LIMIT 1) as preview,
-                 (SELECT sender FROM messages m3 
-                 WHERE m3.filename = messages.filename 
-                 ORDER BY timestamp DESC LIMIT 1) as last_sender
+        # Search is specific, so we can afford a deeper scan
+        query = """
+            SELECT DISTINCT filename, timestamp, message_body, sender
             FROM messages 
-            WHERE timestamp > date('now', '-30 days') 
-            {sender_filter}
-            GROUP BY filename 
-            ORDER BY last_active DESC
-            LIMIT ? OFFSET ?
+            WHERE filename LIKE ? OR message_body LIKE ?
+            ORDER BY timestamp DESC LIMIT ?
         """
-        params = (limit, offset)
-        
+        params = (f"%{search_term}%", f"%{search_term}%", limit)
+    else:
+        # FAST PATH: Just grab latest messages
+        # "Give me the last 2000 messages instantly"
+        query = """
+            SELECT filename, timestamp, message_body, sender
+            FROM messages 
+            ORDER BY timestamp DESC LIMIT ?
+        """
+        params = (limit,)
+
     df = run_query(query, params)
     
-    if not df.empty:
-        df['Phone'] = df['filename'].apply(extract_number)
-        df['Last Active'] = pd.to_datetime(df['last_active'], errors='coerce').dt.strftime('%Y-%m-%d %H:%M')
-        return df[['Phone', 'last_sender', 'preview', 'Last Active', 'filename', 'count']] 
-    return pd.DataFrame()
+    if df.empty: return pd.DataFrame()
 
-def get_full_chat_history(filename, hide_templates=False):
+    # --- PYTHON PROCESSING (Fast) ---
+    # We now have ~2000 rows. We just want unique filenames (users).
+    # keep='first' ensures we keep the most recent message for that user.
+    users = df.drop_duplicates(subset=['filename'], keep='first').copy()
+    
+    # Clean up for display
+    users['Phone'] = users['filename'].apply(extract_number)
+    users['Last Active'] = pd.to_datetime(users['timestamp'], errors='coerce').dt.strftime('%Y-%m-%d %H:%M')
+    users['preview'] = users['message_body']
+    users['last_sender'] = users['sender']
+    
+    # Return formatted table
+    return users[['Phone', 'last_sender', 'preview', 'Last Active', 'filename']]
+
+def get_full_chat(filename, hide_bot=False):
     query = "SELECT timestamp, message_body, sender FROM messages WHERE filename = ?"
-    if hide_templates:
-        query += " AND sender NOT LIKE '%Template%'"
+    if hide_bot: query += " AND sender NOT LIKE '%Template%'"
     query += " ORDER BY timestamp ASC"
     return run_query(query, (filename,))
 
-def get_bulk_export_data(filenames, hide_templates=False):
-    # This might take a moment, so we don't cache it to avoid memory spikes
+def get_bulk_export(filenames):
     placeholders = ','.join('?' for _ in filenames)
-    query = f"SELECT filename, timestamp, sender, message_body FROM messages WHERE filename IN ({placeholders})"
-    if hide_templates:
-        query += " AND sender NOT LIKE '%Template%'"
-    query += " ORDER BY filename, timestamp ASC"
-    
+    query = f"SELECT filename, timestamp, sender, message_body FROM messages WHERE filename IN ({placeholders}) ORDER BY filename, timestamp ASC"
     df = run_query(query, tuple(filenames))
-    if not df.empty:
-        df['Phone'] = df['filename'].apply(extract_number)
-        return df[['Phone', 'timestamp', 'sender', 'message_body']]
+    if not df.empty: df['Phone'] = df['filename'].apply(extract_number)
     return df
 
-# --- 5. STATE & SIDEBAR ---
-if 'view_mode' not in st.session_state: st.session_state.view_mode = "list" 
-if 'page_number' not in st.session_state: st.session_state.page_number = 0
+# --- 5. APP LOGIC ---
+
+if 'view_mode' not in st.session_state: st.session_state.view_mode = "list"
 if 'selected_file' not in st.session_state: st.session_state.selected_file = None
-if 'clean_phone' not in st.session_state: st.session_state.clean_phone = ""
 
 # --- SIDEBAR ---
 with st.sidebar:
-    st.header("⚙️ Filters")
-    hide_templates = st.checkbox("Hide Templates / Bots", value=False)
-    st.markdown("---")
-    st.caption(f"Page: {st.session_state.page_number + 1}")
+    st.header("⚡ Filters")
+    hide_templates = st.checkbox("Hide Templates (Chat View)", value=False)
+    # Reload button to clear cache
+    if st.button("🔄 Refresh Data"):
+        st.cache_data.clear()
+        st.rerun()
 
-# --- 6. APP LOGIC ---
-
-# === VIEW 1: MAIN DASHBOARD ===
+# === MAIN LIST ===
 if st.session_state.view_mode == "list":
     st.title("📂 WATI Chat Manager")
+
+    search = st.text_input("🔍 Search", placeholder="Phone number...")
     
-    col_search, col_prev, col_stat, col_next = st.columns([4, 1, 2, 1])
-    with col_search:
-        search_query = st.text_input("🔍 Search", placeholder="Phone or Keyword...", label_visibility="collapsed")
-    
-    # RESET PAGE ON SEARCH
-    if search_query and 'last_search' in st.session_state and st.session_state.last_search != search_query:
-        st.session_state.page_number = 0
-        st.session_state.last_search = search_query
-        
-    BATCH_SIZE = 500  # <--- UPDATED TO 500
-    current_offset = st.session_state.page_number * BATCH_SIZE
+    with st.spinner("Fetching latest conversations..."):
+        # We fetch 2000 raw messages -> roughly 200-500 unique active users
+        df = get_recent_users(limit=2000, search_term=search)
 
-    # NEXT / PREV BUTTONS
-    with col_prev:
-        if st.button("⬅️ Prev"):
-            if st.session_state.page_number > 0:
-                st.session_state.page_number -= 1
-                st.rerun()
-    with col_next:
-        if st.button("Next ➡️"):
-            st.session_state.page_number += 1
-            st.rerun()
-    with col_stat:
-        st.markdown(f"<div style='text-align: center; padding-top: 10px; color: #666;'>Row {current_offset} - {current_offset + BATCH_SIZE}</div>", unsafe_allow_html=True)
-
-    # 1. GET DATA (Using Cache)
-    with st.spinner('Loading users...'):
-        batch_df = get_batch_users(current_offset, BATCH_SIZE, search_query, hide_templates)
-
-    if batch_df.empty:
-        st.info("No active conversations found in the last 30 days.")
+    if df.empty:
+        st.info("No messages found.")
     else:
-        # --- EXPORT 500 BATCH ---
-        with st.expander(f"📥 Export Current Batch ({len(batch_df)} Users)", expanded=False):
-            if st.button("Download Batch CSV"):
-                with st.spinner("Preparing CSV..."):
-                    export_df = get_bulk_export_data(batch_df['filename'].tolist(), hide_templates)
-                    csv = export_df.to_csv(index=False).encode('utf-8')
-                    st.download_button(
-                        label="📄 Click to Download CSV",
-                        data=csv,
-                        file_name=f"wati_batch_{st.session_state.page_number}.csv",
-                        mime="text/csv"
-                    )
+        st.caption(f"Showing {len(df)} most recently active users.")
+        
+        # Batch Export
+        with st.expander("📥 Export These Users"):
+            if st.button("Download CSV"):
+                export_df = get_bulk_export(df['filename'].tolist())
+                st.download_button("📄 Download", export_df.to_csv(index=False).encode('utf-8'), "wati_export.csv")
 
-        # RENDER TABLE
         event = st.dataframe(
-            batch_df[['Phone', 'last_sender', 'preview', 'Last Active']],
+            df[['Phone', 'last_sender', 'preview', 'Last Active']],
             column_config={
                 "Phone": st.column_config.TextColumn("Contact", width="medium"),
-                "last_sender": st.column_config.TextColumn("Last Sender", width="small"),
+                "last_sender": "Sender",
                 "preview": st.column_config.TextColumn("Latest Message", width="large"),
-                "Last Active": st.column_config.TextColumn("Last Active", width="small"),
+                "Last Active": "Time",
             },
-            use_container_width=True,
+            use_container_width=True, 
             hide_index=True,
             selection_mode="single-row",
             on_select="rerun",
             height=600
         )
         if len(event.selection.rows) > 0:
-            index = event.selection.rows[0]
-            st.session_state.selected_file = batch_df.iloc[index]['filename']
-            st.session_state.clean_phone = batch_df.iloc[index]['Phone']
+            st.session_state.selected_file = df.iloc[event.selection.rows[0]]['filename']
+            st.session_state.clean_phone = df.iloc[event.selection.rows[0]]['Phone']
             st.session_state.view_mode = "chat"
             st.rerun()
 
-# === VIEW 2: CHAT DETAIL ===
+# === CHAT VIEW ===
 elif st.session_state.view_mode == "chat":
-    col_back, col_title, col_dl = st.columns([1, 7, 2])
-    
-    with col_back:
-        if st.button("⬅️ Back"):
-            st.session_state.view_mode = "list"
-            st.session_state.selected_file = None
-            st.rerun()
-            
-    with col_title:
-        st.subheader(f"💬 {st.session_state.clean_phone}")
+    col1, col2 = st.columns([1, 8])
+    if col1.button("⬅️ Back"):
+        st.session_state.view_mode = "list"
+        st.rerun()
+    col2.subheader(f"💬 {st.session_state.clean_phone}")
 
-    # Load Chat
-    chat_df = get_full_chat_history(st.session_state.selected_file, hide_templates)
+    chat_df = get_full_chat(st.session_state.selected_file, hide_templates)
     
-    with col_dl:
-        if not chat_df.empty:
-            csv = chat_df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 Export Chat CSV",
-                data=csv,
-                file_name=f"chat_{st.session_state.clean_phone}.csv",
-                mime="text/csv"
-            )
-
+    if not chat_df.empty:
+        st.download_button("📥 Export Chat", chat_df.to_csv(index=False).encode('utf-8'), "chat.csv")
+    
     st.markdown("---")
-    
-    if chat_df.empty:
-        st.warning("No messages found.")
-    
-    with st.container():
-        for _, row in chat_df.iterrows():
-            sender = row['sender']
-            is_bot = 'Template' in sender or 'System' in sender
-            
-            if is_bot:
-                with st.chat_message("assistant"):
-                    st.write(row['message_body'])
-                    st.caption(f"🤖 {sender} • {row['timestamp']}")
-            else:
-                with st.chat_message("user"):
-                    st.write(row['message_body'])
-                    st.caption(f"👤 {sender} • {row['timestamp']}")
+    for _, row in chat_df.iterrows():
+        is_bot = 'Template' in row['sender'] or 'System' in row['sender']
+        role, av = ("assistant", "🤖") if is_bot else ("user", "👤")
+        with st.chat_message(role):
+            st.write(row['message_body'])
+            st.caption(f"{av} {row['sender']} • {row['timestamp']}")
