@@ -13,37 +13,26 @@ st.markdown("""
     .block-container { padding-top: 2rem; padding-bottom: 2rem; }
     .stButton button { font-weight: bold; border-radius: 8px; }
     
-    /* === CHAT BUBBLE STYLING (High Contrast) === */
-    
-    /* 🤖 Bot/Template: Dark Gray Background, White Text */
+    /* === CHAT BUBBLE STYLING === */
     .stChatMessage[data-testid="stChatMessage"]:has(div[aria-label="assistant"]) {
         background-color: #2e3b4e; 
         border: 1px solid #4a4a4a;
     }
-    
-    /* 👤 User: Blue Background, White Text */
     .stChatMessage[data-testid="stChatMessage"]:has(div[aria-label="user"]) {
         background-color: #0e76a8; 
         border: 1px solid #0e76a8;
-        flex-direction: row-reverse; /* Align to right */
+        flex-direction: row-reverse;
     }
-    
-    /* FORCE TEXT COLOR TO WHITE for visibility in Dark Mode */
     .stChatMessage p, .stChatMessage div, .stChatMessage span {
         color: #ffffff !important;
-    }
-    
-    /* Add subtle shadow to bubbles */
-    .stChatMessage {
-        box-shadow: 0 2px 5px rgba(0,0,0,0.2);
     }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 3. HYBRID CONNECTION ---
+# --- 3. CONNECTION ---
 @st.cache_resource
 def get_conn():
-    # A. Cloud (Turso)
+    # Try Cloud first, then local
     url = os.getenv("TURSO_DB_URL")
     token = os.getenv("TURSO_DB_TOKEN")
     
@@ -51,21 +40,20 @@ def get_conn():
         try:
             import libsql_experimental as libsql
             return libsql.connect(database=url, auth_token=token)
-        except Exception as e:
-            st.warning(f"⚠️ Cloud DB Error: {e}. Trying local...")
+        except Exception:
+            pass # Fallback silently
 
-    # B. Local File
     local_db = "wati_chat_logs.db"
     if os.path.exists(local_db):
         import sqlite3
         return sqlite3.connect(local_db, check_same_thread=False)
 
-    st.error("❌ No Database found! Set Secrets or keep 'wati_chat_logs.db' locally.")
+    st.error("❌ Database Connection Failed.")
     st.stop()
 
 conn = get_conn()
 
-# --- 4. DATA FUNCTIONS ---
+# --- 4. DATA FUNCTIONS (OPTIMIZED) ---
 
 def run_query(query, params=()):
     try:
@@ -84,15 +72,15 @@ def extract_number(filename):
         return filename.split("-")[0]
     return filename.replace(".txt", "")
 
-def get_batch_users(offset, limit=100, search_term=None, hide_templates=False):
-    """
-    Fetches the list of users. 
-    If hide_templates=True, we try to find users who have sent at least one real message.
-    """
+# CACHE: Only keep the CURRENT 500 rows in memory.
+# TTL=600 means if you leave it for 10 mins, it clears to save RAM.
+@st.cache_data(ttl=600, show_spinner=False)
+def get_batch_users(offset, limit=500, search_term=None, hide_templates=False):
     
     sender_filter = "AND sender NOT LIKE '%Template%'" if hide_templates else ""
     
     if search_term:
+        # Search Mode: Needs to scan more, but still paginated
         query = f"""
             SELECT 
                 filename, 
@@ -116,7 +104,8 @@ def get_batch_users(offset, limit=100, search_term=None, hide_templates=False):
         """
         params = (f"%{search_term}%", f"%{search_term}%", limit, offset)
     else:
-        # Optimization: We just grab the latest active users
+        # BROWSE MODE: Restricted to Last 30 Days for Speed
+        # This prevents the DB from grouping 5 years of data every time
         query = f"""
             SELECT 
                 filename, 
@@ -129,7 +118,8 @@ def get_batch_users(offset, limit=100, search_term=None, hide_templates=False):
                  WHERE m3.filename = messages.filename 
                  ORDER BY timestamp DESC LIMIT 1) as last_sender
             FROM messages 
-            WHERE 1=1 {sender_filter}
+            WHERE timestamp > date('now', '-30 days') 
+            {sender_filter}
             GROUP BY filename 
             ORDER BY last_active DESC
             LIMIT ? OFFSET ?
@@ -146,27 +136,20 @@ def get_batch_users(offset, limit=100, search_term=None, hide_templates=False):
 
 def get_full_chat_history(filename, hide_templates=False):
     query = "SELECT timestamp, message_body, sender FROM messages WHERE filename = ?"
-    
     if hide_templates:
         query += " AND sender NOT LIKE '%Template%'"
-        
     query += " ORDER BY timestamp ASC"
     return run_query(query, (filename,))
 
 def get_bulk_export_data(filenames, hide_templates=False):
-    """
-    Fetches FULL chat history for a list of filenames (for the CSV export).
-    """
+    # This might take a moment, so we don't cache it to avoid memory spikes
     placeholders = ','.join('?' for _ in filenames)
     query = f"SELECT filename, timestamp, sender, message_body FROM messages WHERE filename IN ({placeholders})"
-    
     if hide_templates:
         query += " AND sender NOT LIKE '%Template%'"
-        
     query += " ORDER BY filename, timestamp ASC"
     
     df = run_query(query, tuple(filenames))
-    # Clean up filename to phone for the CSV
     if not df.empty:
         df['Phone'] = df['filename'].apply(extract_number)
         return df[['Phone', 'timestamp', 'sender', 'message_body']]
@@ -178,14 +161,10 @@ if 'page_number' not in st.session_state: st.session_state.page_number = 0
 if 'selected_file' not in st.session_state: st.session_state.selected_file = None
 if 'clean_phone' not in st.session_state: st.session_state.clean_phone = ""
 
-# --- SIDEBAR FILTERS ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.header("⚙️ Filters")
-    st.write("Control what you see and export.")
-    
-    # Filter: Hide Templates
-    hide_templates = st.checkbox("Hide Templates / Bots", value=False, help="Hides messages sent by 'Template' or system bots.")
-    
+    hide_templates = st.checkbox("Hide Templates / Bots", value=False)
     st.markdown("---")
     st.caption(f"Page: {st.session_state.page_number + 1}")
 
@@ -199,12 +178,15 @@ if st.session_state.view_mode == "list":
     with col_search:
         search_query = st.text_input("🔍 Search", placeholder="Phone or Keyword...", label_visibility="collapsed")
     
-    if search_query and st.session_state.page_number != 0:
+    # RESET PAGE ON SEARCH
+    if search_query and 'last_search' in st.session_state and st.session_state.last_search != search_query:
         st.session_state.page_number = 0
+        st.session_state.last_search = search_query
         
-    BATCH_SIZE = 100
+    BATCH_SIZE = 500  # <--- UPDATED TO 500
     current_offset = st.session_state.page_number * BATCH_SIZE
 
+    # NEXT / PREV BUTTONS
     with col_prev:
         if st.button("⬅️ Prev"):
             if st.session_state.page_number > 0:
@@ -215,32 +197,29 @@ if st.session_state.view_mode == "list":
             st.session_state.page_number += 1
             st.rerun()
     with col_stat:
-        st.markdown(f"<div style='text-align: center; padding-top: 10px; color: #666;'>Row {current_offset}+</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='text-align: center; padding-top: 10px; color: #666;'>Row {current_offset} - {current_offset + BATCH_SIZE}</div>", unsafe_allow_html=True)
 
-    # 1. Get the List of Users
-    batch_df = get_batch_users(current_offset, BATCH_SIZE, search_query, hide_templates)
+    # 1. GET DATA (Using Cache)
+    with st.spinner('Loading users...'):
+        batch_df = get_batch_users(current_offset, BATCH_SIZE, search_query, hide_templates)
 
     if batch_df.empty:
-        st.info("No conversations found. Try changing filters.")
+        st.info("No active conversations found in the last 30 days.")
     else:
-        # --- NEW: BATCH EXPORT BUTTON ---
-        # Logic: We take the filenames from the current view and fetch their content
-        with st.expander("📥 Export Options", expanded=False):
-            st.write(f"Exporting data for these {len(batch_df)} users...")
+        # --- EXPORT 500 BATCH ---
+        with st.expander(f"📥 Export Current Batch ({len(batch_df)} Users)", expanded=False):
             if st.button("Download Batch CSV"):
-                # Fetch full content for these users
-                export_df = get_bulk_export_data(batch_df['filename'].tolist(), hide_templates)
-                
-                # Convert to CSV
-                csv = export_df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="📄 Click to Download CSV",
-                    data=csv,
-                    file_name=f"wati_batch_export_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv"
-                )
+                with st.spinner("Preparing CSV..."):
+                    export_df = get_bulk_export_data(batch_df['filename'].tolist(), hide_templates)
+                    csv = export_df.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        label="📄 Click to Download CSV",
+                        data=csv,
+                        file_name=f"wati_batch_{st.session_state.page_number}.csv",
+                        mime="text/csv"
+                    )
 
-        # Render Table
+        # RENDER TABLE
         event = st.dataframe(
             batch_df[['Phone', 'last_sender', 'preview', 'Last Active']],
             column_config={
@@ -275,7 +254,7 @@ elif st.session_state.view_mode == "chat":
     with col_title:
         st.subheader(f"💬 {st.session_state.clean_phone}")
 
-    # Fetch Data (Respecting Sidebar Filter)
+    # Load Chat
     chat_df = get_full_chat_history(st.session_state.selected_file, hide_templates)
     
     with col_dl:
@@ -291,25 +270,18 @@ elif st.session_state.view_mode == "chat":
     st.markdown("---")
     
     if chat_df.empty:
-        st.warning("No messages found with current filters (try unchecking 'Hide Templates').")
+        st.warning("No messages found.")
     
-    # Render Chat
     with st.container():
         for _, row in chat_df.iterrows():
             sender = row['sender']
-            msg = row['message_body']
-            time = row['timestamp']
-            
-            # Visual Logic: 
-            # If sender contains "Template", "System", or is generic -> Robot Side
-            # Else -> User Side
             is_bot = 'Template' in sender or 'System' in sender
             
             if is_bot:
                 with st.chat_message("assistant"):
-                    st.write(msg)
-                    st.caption(f"🤖 {sender} • {time}")
+                    st.write(row['message_body'])
+                    st.caption(f"🤖 {sender} • {row['timestamp']}")
             else:
                 with st.chat_message("user"):
-                    st.write(msg)
-                    st.caption(f"👤 {sender} • {time}")
+                    st.write(row['message_body'])
+                    st.caption(f"👤 {sender} • {row['timestamp']}")
