@@ -1,0 +1,7 @@
+wati_chat_logs.db
+__pycache__/
+.env
+.DS_Store
+wati_chat_logs.db-wal
+wati_chat_logs.db-shm
+turso.txt

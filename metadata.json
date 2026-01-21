@@ -1,0 +1,20 @@
+{
+    "title": "WATI Message Archive",
+    "description": "Searchable archive of 1.8M WATI template messages. Internal use only.",
+    "source": "Exported from local text files",
+    "databases": {
+        "wati_chat_logs": {
+            "tables": {
+                "messages": {
+                    "title": "Chat Logs",
+                    "description": "All parsed messages with timestamps.",
+                    "sort_desc": "timestamp",
+                    "facets": ["sender", "status"],
+                    "units": {
+                        "timestamp": "UTC"
+                    }
+                }
+            }
+        }
+    }
+}
