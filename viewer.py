@@ -2,90 +2,69 @@ import streamlit as st
 import pandas as pd
 import libsql_experimental as libsql
 import os
+from datetime import datetime, timedelta
 
-# --- PAGE CONFIGURATION ---
+# --- 1. PAGE CONFIG ---
 st.set_page_config(layout="wide", page_title="WATI Chat Manager")
 
-# --- 2. CSS FOR VISIBILITY & LAYOUT ---
+# --- 2. CSS ---
 st.markdown("""
 <style>
-    /* Full width table */
     .stDataFrame { width: 100%; }
-    
-    /* Push content down so buttons aren't cut off */
-    .block-container { 
-        padding-top: 4rem; 
-        padding-bottom: 2rem; 
-    }
-    
-    /* Back Button Styling */
-    .stButton button {
-        font-weight: bold;
-        border-radius: 8px;
-    }
-    
-    /* --- FIX: FORCE DARK TEXT IN CHAT BUBBLES --- */
-    /* This ensures text is black even if your Mac is in Dark Mode */
+    .block-container { padding-top: 4rem; padding-bottom: 2rem; }
+    .stButton button { font-weight: bold; border-radius: 8px; }
     .stChatMessage {
         background-color: #f8f9fa; 
-        color: #262730 !important; /* Dark Charcoal Text */
+        color: #262730 !important;
         border: 1px solid #e9ecef;
         border-radius: 12px;
         padding: 15px;
         margin-bottom: 10px;
     }
-    
-    /* Force inner text elements (paragraphs, markdown) to be dark too */
-    .stChatMessage p, .stChatMessage div, .stChatMessage span, .stChatMessage strong {
+    .stChatMessage p, .stChatMessage div, .stChatMessage span {
         color: #262730 !important;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 3. DATABASE CONNECTION ---
+# --- 3. CONNECTION ---
 @st.cache_resource
 def get_conn():
-    # 1. Try to get secrets from Environment Variables (Vercel/Streamlit Cloud)
     url = os.getenv("TURSO_DB_URL")
     token = os.getenv("TURSO_DB_TOKEN")
-
-    # 2. If secrets exist, use Turso (Cloud)
-    if url and token:
-        try:
-            return libsql.connect(database=url, auth_token=token)
-        except Exception as e:
-            st.error(f"❌ Failed to connect to Turso: {e}")
-            st.stop()
-    
-    # 3. If no secrets, try local file (for when you run on your Mac)
-    # This acts as a fallback so it still works on your machine
-    local_db = "wati_chat_logs.db"
-    if os.path.exists(local_db):
-        import sqlite3
-        return sqlite3.connect(local_db, check_same_thread=False)
-    
-    # 4. If neither works -> ERROR
-    st.error("❌ Database Connection Failed. No Turso credentials found AND no local 'wati_chat_logs.db' file found.")
-    st.info("If you are on Vercel: Make sure you added TURSO_DB_URL and TURSO_DB_TOKEN in Settings > Environment Variables.")
-    st.stop()
+    if not url or not token:
+        st.error("Missing Secrets: TURSO_DB_URL or TURSO_DB_TOKEN")
+        st.stop()
+    return libsql.connect(database=url, auth_token=token)
 
 conn = get_conn()
 
-# --- 5. SESSION STATE ---
-if 'view_mode' not in st.session_state:
-    st.session_state.view_mode = "list" 
-if 'page_number' not in st.session_state:
-    st.session_state.page_number = 0
-if 'selected_file' not in st.session_state:
-    st.session_state.selected_file = None
-if 'clean_phone' not in st.session_state:
-    st.session_state.clean_phone = ""
+# --- 4. DATA FUNCTIONS (Optimized) ---
 
-# --- 6. DATA FUNCTIONS ---
+def run_query(query, params=()):
+    """
+    Manual query execution to avoid Pandas/SQLAlchemy warnings
+    """
+    try:
+        cursor = conn.execute(query, params)
+        columns = [description[0] for description in cursor.description]
+        data = cursor.fetchall()
+        return pd.DataFrame(data, columns=columns)
+    except Exception as e:
+        st.error(f"Query Error: {e}")
+        return pd.DataFrame()
+
+def extract_number(filename):
+    if "-" in filename:
+        return filename.split("-")[0]
+    return filename.replace(".txt", "")
 
 def get_batch_users(offset, limit=100, search_term=None):
-    """Fetch user list + Latest Message Preview"""
+    # OPTIMIZATION: Default to last 90 days if no search term
+    # This uses the 'idx_timestamp' index to be INSTANT.
+    
     if search_term:
+        # Search mode: Must scan for keyword
         query = """
             SELECT 
                 filename, 
@@ -105,6 +84,8 @@ def get_batch_users(offset, limit=100, search_term=None):
         """
         params = (f"%{search_term}%", f"%{search_term}%", limit, offset)
     else:
+        # Browse mode: Restrict to recent history for speed
+        # '2020-01-01' is a fallback, but practically we want the index to work.
         query = """
             SELECT 
                 filename, 
@@ -114,17 +95,19 @@ def get_batch_users(offset, limit=100, search_term=None):
                  WHERE m2.filename = messages.filename 
                  ORDER BY timestamp DESC LIMIT 1) as preview
             FROM messages 
+            WHERE timestamp > date('now', '-90 days') 
             GROUP BY filename 
             ORDER BY last_active DESC
             LIMIT ? OFFSET ?
         """
         params = (limit, offset)
         
-    df = pd.read_sql(query, conn, params=params)
+    df = run_query(query, params)
     
     if not df.empty:
         df['Phone'] = df['filename'].apply(extract_number)
-        df['Last Active'] = pd.to_datetime(df['last_active']).dt.strftime('%Y-%m-%d %H:%M')
+        # Handle cases where Last Active might be None or format it
+        df['Last Active'] = pd.to_datetime(df['last_active'], errors='coerce').dt.strftime('%Y-%m-%d %H:%M')
         return df[['Phone', 'count', 'preview', 'Last Active', 'filename']] 
     return pd.DataFrame()
 
@@ -135,21 +118,23 @@ def get_full_chat_history(filename):
         WHERE filename = ? 
         ORDER BY timestamp ASC
     """
-    return pd.read_sql(query, conn, params=(filename,))
+    return run_query(query, (filename,))
 
-# --- 7. MAIN APP LOGIC ---
+# --- 5. STATE ---
+if 'view_mode' not in st.session_state: st.session_state.view_mode = "list" 
+if 'page_number' not in st.session_state: st.session_state.page_number = 0
+if 'selected_file' not in st.session_state: st.session_state.selected_file = None
+if 'clean_phone' not in st.session_state: st.session_state.clean_phone = ""
 
-# === VIEW 1: DASHBOARD LIST ===
+# --- 6. APP LOGIC ---
+
 if st.session_state.view_mode == "list":
     st.title("📂 WATI Chat Manager")
-
-    # Controls: Search | Prev | Stats | Next
-    col_search, col_prev, col_stat, col_next = st.columns([4, 1, 2, 1])
     
+    col_search, col_prev, col_stat, col_next = st.columns([4, 1, 2, 1])
     with col_search:
         search_query = st.text_input("🔍 Search", placeholder="Phone or Keyword...", label_visibility="collapsed")
     
-    # Reset pagination if searching
     if search_query and st.session_state.page_number != 0:
         st.session_state.page_number = 0
         
@@ -161,26 +146,24 @@ if st.session_state.view_mode == "list":
             if st.session_state.page_number > 0:
                 st.session_state.page_number -= 1
                 st.rerun()
-
     with col_next:
         if st.button("Next ➡️"):
             st.session_state.page_number += 1
             st.rerun()
-
     with col_stat:
-        st.markdown(f"<div style='text-align: center; padding-top: 10px; color: #666; font-size: 0.9em;'>Rows {current_offset} - {current_offset + BATCH_SIZE}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='text-align: center; padding-top: 10px; color: #666;'>Row {current_offset}+</div>", unsafe_allow_html=True)
 
-    # Render Table
+    # Load Data
     batch_df = get_batch_users(current_offset, BATCH_SIZE, search_query)
 
     if batch_df.empty:
-        st.info("No users found.")
+        st.info("No active users found in the last 90 days. Try searching specifically.")
     else:
         event = st.dataframe(
             batch_df[['Phone', 'count', 'preview', 'Last Active']],
             column_config={
                 "Phone": st.column_config.TextColumn("Contact", width="medium"),
-                "count": st.column_config.NumberColumn("No of Messages", width="small"),
+                "count": st.column_config.NumberColumn("Msgs", width="small"),
                 "preview": st.column_config.TextColumn("Latest Message", width="large"),
                 "Last Active": st.column_config.TextColumn("Last Active", width="small"),
             },
@@ -190,8 +173,6 @@ if st.session_state.view_mode == "list":
             on_select="rerun",
             height=700
         )
-
-        # Handle Click
         if len(event.selection.rows) > 0:
             index = event.selection.rows[0]
             st.session_state.selected_file = batch_df.iloc[index]['filename']
@@ -199,26 +180,19 @@ if st.session_state.view_mode == "list":
             st.session_state.view_mode = "chat"
             st.rerun()
 
-# === VIEW 2: FULL CHAT ===
 elif st.session_state.view_mode == "chat":
-    
-    # Back Button & Header
     col_back, col_title = st.columns([1, 10])
     with col_back:
         if st.button("⬅️ Back"):
             st.session_state.view_mode = "list"
             st.session_state.selected_file = None
             st.rerun()
-            
     with col_title:
         st.subheader(f"💬 Conversation with {st.session_state.clean_phone}")
 
-    # Load Chat
     chat_df = get_full_chat_history(st.session_state.selected_file)
-    
     st.markdown("---")
     
-    # Display Bubbles
     with st.container():
         for _, row in chat_df.iterrows():
             with st.chat_message("assistant"):
